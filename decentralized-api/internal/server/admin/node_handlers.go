@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"decentralized-api/apiconfig"
 	"decentralized-api/broker"
 	"decentralized-api/logging"
@@ -17,6 +18,65 @@ func (s *Server) getNodes(ctx echo.Context) error {
 		logging.Error("Error getting nodes", types.Nodes, "error", err)
 		return err
 	}
+	osm := NewOnboardingStateManager()
+	sr := NewStatusReporter()
+	chainActive := false
+	if s.nodeBroker != nil {
+		active, err := s.nodeBroker.IsParticipantActiveOnChain()
+		if err != nil {
+			logging.Warn("Failed to check participant active status", types.Nodes, "error", err)
+		} else {
+			chainActive = active
+		}
+	}
+
+	for i := range nodes {
+		state := &nodes[i].State
+		participantActive := chainActive || len(state.EpochMLNodes) > 0
+		pstate := osm.ParticipantStatus(participantActive)
+		prevParticipant := ParticipantState(state.ParticipantState)
+		if prevParticipant != pstate {
+			sr.LogParticipantStatusChange(prevParticipant, pstate)
+		}
+		state.ParticipantState = string(pstate)
+
+		var secs int64
+		if state.Timing != nil {
+			secs = state.Timing.SecondsUntilNextPoC
+			sr.LogTimingGuidance(secs)
+		}
+
+		isTesting := false
+		testFailed := state.FailureReason != ""
+		if !participantActive {
+			isTesting = false
+			testFailed = false
+		}
+		mlnodeState, _, _ := osm.MLNodeStatus(secs, isTesting, testFailed)
+		var userMsg string
+		if participantActive {
+			userMsg = sr.BuildMLNodeMessage(mlnodeState, secs, "")
+		}
+		if userMsg == "" {
+			userMsg = sr.BuildNoModelGuidance(secs)
+		}
+
+		prevOnboarding := MLNodeOnboardingState(state.MLNodeOnboardingState)
+		if prevOnboarding != mlnodeState {
+			sr.LogOnboardingTransition(prevOnboarding, mlnodeState)
+		}
+		state.MLNodeOnboardingState = string(mlnodeState)
+		state.UserMessage = userMsg
+		state.Guidance = sr.BuildParticipantMessage(pstate)
+
+		logging.Info("Admin getNodes state", types.Nodes,
+			"node_id", nodes[i].Node.Id,
+			"participant_state", state.ParticipantState,
+			"mlnode_state", state.MLNodeOnboardingState,
+			"user_message", state.UserMessage,
+			"guidance", state.Guidance)
+	}
+
 	return ctx.JSON(http.StatusOK, nodes)
 }
 
@@ -146,6 +206,39 @@ func (s *Server) createNewNode(ctx echo.Context) error {
 		}
 		// sync config file with updated node list
 		syncNodesWithConfig(s.nodeBroker, s.configManager)
+
+		// Auto-test trigger after update (uses orchestrator)
+		getCmd := broker.NewGetNodesCommand()
+		if err := s.nodeBroker.QueueMessage(getCmd); err == nil {
+			responses := <-getCmd.Response
+			var secs int64
+			for _, resp := range responses {
+				if resp.Node.Id == newNode.Id && resp.State.Timing != nil {
+					secs = resp.State.Timing.SecondsUntilNextPoC
+					break
+				}
+			}
+			if s.tester.ShouldAutoTest(secs) {
+				s.statusReporter.LogTesting("Auto-testing MLnode configuration")
+				s.testingNodes[newNode.Id] = true
+				result := s.tester.RunNodeTest(context.Background(), *node)
+				delete(s.testingNodes, newNode.Id)
+				if result != nil {
+					if result.Status == TestFailed {
+						cmd := broker.NewSetNodeFailureReasonCommand(newNode.Id, result.Error)
+						if err := s.nodeBroker.QueueMessage(cmd); err != nil {
+							logging.Warn("Failed to set node failure reason", types.Nodes, "node_id", newNode.Id, "error", err)
+						}
+					} else {
+						cmd := broker.NewSetNodeFailureReasonCommand(newNode.Id, "")
+						if err := s.nodeBroker.QueueMessage(cmd); err != nil {
+							logging.Warn("Failed to clear node failure reason", types.Nodes, "node_id", newNode.Id, "error", err)
+						}
+					}
+					s.latestTestResults[newNode.Id] = result
+				}
+			}
+		}
 		return ctx.JSON(http.StatusOK, node)
 	} else {
 		node, err := s.addNode(newNode)
@@ -184,16 +277,90 @@ func (s *Server) addNode(newNode apiconfig.InferenceNodeConfig) (apiconfig.Infer
 		return apiconfig.InferenceNodeConfig{}, echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("failed to save node configuration: %v", err))
 	}
 
+	// Auto-test trigger: run pre-PoC validation if timing allows (>1h until next PoC)
+	// Fetch timing info from broker
+	getCmd := broker.NewGetNodesCommand()
+	if err := s.nodeBroker.QueueMessage(getCmd); err == nil {
+		responses := <-getCmd.Response
+		var secs int64
+		for _, resp := range responses {
+			if resp.Node.Id == newNode.Id && resp.State.Timing != nil {
+				secs = resp.State.Timing.SecondsUntilNextPoC
+				break
+			}
+		}
+		if s.tester.ShouldAutoTest(secs) {
+			s.statusReporter.LogTesting("Auto-testing MLnode configuration")
+			s.testingNodes[newNode.Id] = true
+			result := s.tester.RunNodeTest(context.Background(), *node)
+			delete(s.testingNodes, newNode.Id)
+			if result != nil {
+				if result.Status == TestFailed {
+					cmd := broker.NewSetNodeFailureReasonCommand(newNode.Id, result.Error)
+					if err := s.nodeBroker.QueueMessage(cmd); err != nil {
+						logging.Warn("Failed to set node failure reason", types.Nodes, "node_id", newNode.Id, "error", err)
+					}
+				} else {
+					// Clear any previous failure reason on success
+					cmd := broker.NewSetNodeFailureReasonCommand(newNode.Id, "")
+					if err := s.nodeBroker.QueueMessage(cmd); err != nil {
+						logging.Warn("Failed to clear node failure reason", types.Nodes, "node_id", newNode.Id, "error", err)
+					}
+				}
+				s.latestTestResults[newNode.Id] = result
+			}
+		}
+	}
+
 	return *node, nil
+}
+
+// postNodeTest triggers a manual MLnode validation test for a specific node
+func (s *Server) postNodeTest(ctx echo.Context) error {
+	nodeId := ctx.Param("id")
+	if nodeId == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "node id is required")
+	}
+
+	// Find node config by id
+	var cfgNode *apiconfig.InferenceNodeConfig
+	nodes := s.configManager.GetNodes()
+	for i := range nodes {
+		if nodes[i].Id == nodeId {
+			cfgNode = &nodes[i]
+			break
+		}
+	}
+	if cfgNode == nil {
+		return echo.NewHTTPError(http.StatusNotFound, fmt.Sprintf("node not found: %s", nodeId))
+	}
+
+	logging.Info("Admin manual test start", types.Nodes, "node_id", nodeId)
+	result := s.tester.RunNodeTest(context.Background(), *cfgNode)
+	if result != nil {
+		if result.Status == TestFailed {
+			cmd := broker.NewSetNodeFailureReasonCommand(nodeId, result.Error)
+			if err := s.nodeBroker.QueueMessage(cmd); err != nil {
+				logging.Warn("Failed to set node failure reason", types.Nodes, "node_id", nodeId, "error", err)
+			}
+		} else {
+			cmd := broker.NewSetNodeFailureReasonCommand(nodeId, "")
+			if err := s.nodeBroker.QueueMessage(cmd); err != nil {
+				logging.Warn("Failed to clear node failure reason", types.Nodes, "node_id", nodeId, "error", err)
+			}
+		}
+		logging.Info("Admin manual test result", types.Nodes, "node_id", nodeId, "status", string(result.Status), "error", result.Error)
+		s.latestTestResults[nodeId] = result
+	}
+
+	return ctx.JSON(http.StatusOK, result)
 }
 
 // enableNode handles POST /admin/v1/nodes/:id/enable
 func (s *Server) enableNode(c echo.Context) error {
 	nodeId := c.Param("id")
 	if nodeId == "" {
-		return c.JSON(http.StatusBadRequest, map[string]string{
-			"error": "node id is required",
-		})
+		return echo.NewHTTPError(http.StatusBadRequest, "node id is required")
 	}
 
 	response := make(chan error, 2)
@@ -203,15 +370,11 @@ func (s *Server) enableNode(c echo.Context) error {
 		Response: response,
 	})
 	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{
-			"error": "failed to queue command: " + err.Error(),
-		})
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to queue command: "+err.Error())
 	}
 
 	if err := <-response; err != nil {
-		return c.JSON(http.StatusNotFound, map[string]string{
-			"error": err.Error(),
-		})
+		return echo.NewHTTPError(http.StatusNotFound, err.Error())
 	}
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
@@ -224,9 +387,7 @@ func (s *Server) enableNode(c echo.Context) error {
 func (s *Server) disableNode(c echo.Context) error {
 	nodeId := c.Param("id")
 	if nodeId == "" {
-		return c.JSON(http.StatusBadRequest, map[string]string{
-			"error": "node id is required",
-		})
+		return echo.NewHTTPError(http.StatusBadRequest, "node id is required")
 	}
 
 	response := make(chan error, 2)
@@ -236,15 +397,11 @@ func (s *Server) disableNode(c echo.Context) error {
 		Response: response,
 	})
 	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{
-			"error": "failed to queue command: " + err.Error(),
-		})
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to queue command: "+err.Error())
 	}
 
 	if err := <-response; err != nil {
-		return c.JSON(http.StatusNotFound, map[string]string{
-			"error": err.Error(),
-		})
+		return echo.NewHTTPError(http.StatusNotFound, err.Error())
 	}
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
@@ -259,12 +416,12 @@ func (s *Server) exportDb(c echo.Context) error {
 	db := s.configManager.SqlDb()
 	if db == nil || db.GetDb() == nil {
 		logging.Error("DB not initialized", types.Nodes)
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "db not initialized"})
+		return echo.NewHTTPError(http.StatusInternalServerError, "db not initialized")
 	}
 	payload, err := apiconfig.ExportAllDb(ctx, db.GetDb())
 	if err != nil {
 		logging.Error("Failed to export DB state", types.Nodes, "error", err)
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(http.StatusOK, payload)
 }

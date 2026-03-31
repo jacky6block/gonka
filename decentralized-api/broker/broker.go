@@ -107,22 +107,23 @@ func (b *BrokerChainBridgeImpl) GetParams() (*types.QueryParamsResponse, error) 
 }
 
 type Broker struct {
-	highPriorityCommands chan Command
-	lowPriorityCommands  chan Command
-	nodes                map[string]*NodeWithState
-	mu                   sync.RWMutex
-	curMaxNodesNum       atomic.Uint64
-	chainBridge          BrokerChainBridge
-	nodeWorkGroup        *NodeWorkGroup
-	phaseTracker         *chainphase.ChainPhaseTracker
-	participantInfo      participant.CurrenParticipantInfo
-	callbackUrl          string
-	mlNodeClientFactory  mlnodeclient.ClientFactory
-	reconcileTrigger     chan struct{}
-	lastEpochIndex       uint64
-	lastEpochPhase       types.EpochPhase
-	statusQueryTrigger   chan statusQuerySignal
-	configManager        *apiconfig.ConfigManager
+	highPriorityCommands  chan Command
+	lowPriorityCommands   chan Command
+	nodes                 map[string]*NodeWithState
+	mu                    sync.RWMutex
+	curMaxNodesNum        atomic.Uint64
+	chainBridge           BrokerChainBridge
+	nodeWorkGroup         *NodeWorkGroup
+	phaseTracker          *chainphase.ChainPhaseTracker
+	participantInfo       participant.CurrenParticipantInfo
+	callbackUrl           string
+	mlNodeClientFactory   mlnodeclient.ClientFactory
+	reconcileTrigger      chan struct{}
+	lastEpochIndex        uint64
+	lastEpochPhase        types.EpochPhase
+	lastParticipantWeight int64
+	statusQueryTrigger    chan statusQuerySignal
+	configManager         *apiconfig.ConfigManager
 }
 
 // GetParticipantAddress returns the current participant's address if available.
@@ -133,56 +134,10 @@ func (b *Broker) GetParticipantAddress() string {
 	return b.participantInfo.GetAddress()
 }
 
-// IsPoCv2Enabled returns whether PoC V2 (off-chain artifacts) is enabled.
-// Returns true by default if phaseTracker is not available.
-func (b *Broker) IsPoCv2Enabled() bool {
-	if b == nil || b.phaseTracker == nil {
-		return true // default V2
-	}
-	return b.phaseTracker.IsPoCv2Enabled()
-}
-
-// IsV2EndpointsEnabled returns whether V2 endpoints should be enabled.
-// True when poc_v2_enabled=true OR confirmation_poc_v2_enabled=true (migration mode).
-func (b *Broker) IsV2EndpointsEnabled() bool {
-	if b == nil || b.phaseTracker == nil {
-		return true
-	}
-	return b.phaseTracker.IsPoCv2Enabled() || b.phaseTracker.IsConfirmationPoCv2Enabled()
-}
-
-// IsMigrationMode returns whether we're in migration mode.
-// Migration mode: poc_v2_enabled=false, confirmation_poc_v2_enabled=true.
-func (b *Broker) IsMigrationMode() bool {
-	if b == nil || b.phaseTracker == nil {
-		return false
-	}
-	return !b.phaseTracker.IsPoCv2Enabled() && b.phaseTracker.IsConfirmationPoCv2Enabled()
-}
-
-// shouldUseV2ForPoC determines if V2 should be used for PoC based on mode and event.
-// - Full V2 mode: always V2
-// - Migration mode + confirmation PoC event_sequence == 0: V2
-// - Otherwise: V1
-func (b *Broker) shouldUseV2ForPoC(confirmationEvent *types.ConfirmationPoCEvent) bool {
-	if b.IsPoCv2Enabled() {
-		return true
-	}
-	if b.IsMigrationMode() && confirmationEvent != nil && confirmationEvent.EventSequence == 0 {
-		return true
-	}
-	return false
-}
-
 const PoCBatchesBasePathV2 = "/v2/poc-batches"
-const PoCBatchesBasePathV1 = "/v1/poc-batches"
 
 func GetPoCCallbackBaseURLV2(callbackUrl string) string {
 	return fmt.Sprintf("%s%s", callbackUrl, PoCBatchesBasePathV2)
-}
-
-func GetPoCCallbackBaseURLV1(callbackUrl string) string {
-	return fmt.Sprintf("%s%s", callbackUrl, PoCBatchesBasePathV1)
 }
 
 type ModelArgs struct {
@@ -254,6 +209,14 @@ type NodeState struct {
 	// Epoch-specific data, populated from the chain
 	EpochModels  map[string]types.Model      `json:"epoch_models"`
 	EpochMLNodes map[string]types.MLNodeInfo `json:"epoch_ml_nodes"`
+
+	Timing *TimingInfo `json:"timing,omitempty"`
+
+	UserMessage           string `json:"user_message,omitempty"`
+	Guidance              string `json:"guidance,omitempty"`
+	ParticipantState      string `json:"participant_state,omitempty"`
+	MLNodeOnboardingState string `json:"mlnode_state,omitempty"`
+	ParticipantWeight     int64  `json:"participant_weight,omitempty"`
 }
 
 func (s NodeState) MarshalJSON() ([]byte, error) {
@@ -349,6 +312,13 @@ type NodeResponse struct {
 	State NodeState `json:"state"`
 }
 
+type TimingInfo struct {
+	CurrentPhase        string `json:"current_phase"`
+	BlocksUntilNextPoC  int64  `json:"blocks_until_next_poc"`
+	SecondsUntilNextPoC int64  `json:"seconds_until_next_poc"`
+	ShouldBeOnline      bool   `json:"should_be_online"`
+}
+
 func NewBroker(chainBridge BrokerChainBridge, phaseTracker *chainphase.ChainPhaseTracker, participantInfo participant.CurrenParticipantInfo, callbackUrl string, clientFactory mlnodeclient.ClientFactory, configManager *apiconfig.ConfigManager) *Broker {
 	broker := &Broker{
 		highPriorityCommands: make(chan Command, 100),
@@ -373,6 +343,18 @@ func NewBroker(chainBridge BrokerChainBridge, phaseTracker *chainphase.ChainPhas
 	// go nodeReconciliationWorker(broker)
 	go nodeStatusQueryWorker(broker)
 	go broker.reconcilerLoop()
+
+	// Startup: try to populate epoch data once chain is synced to expose participant status early
+	go func() {
+		for i := 0; i < 10; i++ {
+			es := broker.phaseTracker.GetCurrentEpochState()
+			if es != nil && es.IsSynced {
+				_ = broker.UpdateNodeWithEpochData(es)
+				return
+			}
+			time.Sleep(1 * time.Second)
+		}
+	}()
 	return broker
 }
 
@@ -472,6 +454,10 @@ func (b *Broker) executeCommand(command Command) {
 		command.Execute(b)
 	case UpdateNodeResultCommand:
 		command.Execute(b)
+	case SetNodeFailureReasonCommand:
+		command.Execute(b)
+	case SetNodeMLNodeOnboardingStateCommand:
+		command.Execute(b)
 	default:
 		logging.Error("Unregistered command type", types.Nodes, "type", reflect.TypeOf(command).String())
 	}
@@ -492,6 +478,8 @@ func (b *Broker) QueueMessage(command Command) error {
 	switch command.(type) {
 	case StartPocCommand, InitValidateCommand, InferenceUpAllCommand, UpdateNodeResultCommand, SetNodesActualStatusCommand, SetNodeAdminStateCommand, RegisterNode, RemoveNode, StartTrainingCommand, LockNodesForTrainingCommand, SyncNodesCommand:
 		b.highPriorityCommands <- command
+	case SetNodeFailureReasonCommand:
+		b.highPriorityCommands <- command
 	default:
 		b.lowPriorityCommands <- command
 	}
@@ -507,9 +495,9 @@ func (b *Broker) lockAvailableNode(command LockAvailableNode) {
 	leastBusyNode := b.getLeastBusyNode(command)
 
 	if leastBusyNode != nil {
-		b.mu.RLock()
+		b.mu.Lock()
 		leastBusyNode.State.LockCount++
-		b.mu.RUnlock()
+		b.mu.Unlock()
 	}
 	logging.Debug("Locked node", types.Nodes, "node", leastBusyNode)
 	if leastBusyNode == nil {
@@ -595,23 +583,19 @@ func (b *Broker) nodeAvailable(node *NodeWithState, neededModel string, currentE
 }
 
 func (b *Broker) releaseNode(command ReleaseNode) {
-	b.mu.RLock()
+	b.mu.Lock()
 	node, ok := b.nodes[command.NodeId]
-	b.mu.RUnlock()
+	if ok {
+		node.State.LockCount--
+	}
+	b.mu.Unlock()
 
 	if !ok {
 		command.Response <- false
 		return
-	} else {
-		b.mu.RLock()
-		node.State.LockCount--
-		b.mu.RUnlock()
-		if !command.Outcome.IsSuccess() {
-			logging.Error("Node failed", types.Nodes, "node_id", command.NodeId, "reason", command.Outcome.GetMessage())
-			// FIXME: need a write lock here?
-			//  not sure if we should update the state, we have health checks for that
-			// node.State.Failure("Inference failed")
-		}
+	}
+	if !command.Outcome.IsSuccess() {
+		logging.Error("Node failed", types.Nodes, "node_id", command.NodeId, "reason", command.Outcome.GetMessage())
 	}
 	logging.Debug("Released node", types.Nodes, "node_id", command.NodeId)
 	command.Response <- true
@@ -1238,46 +1222,20 @@ func (b *Broker) getCommandForState(nodeState *NodeState, pocGenParams *pocParam
 		switch nodeState.PocIntendedStatus {
 		case PocStatusGenerating:
 			if pocGenParams != nil && pocGenParams.startPoCBlockHeight > 0 {
-				// Dispatch V1 or V2 based on governance parameter and migration mode
-				if b.shouldUseV2ForPoC(confirmationEvent) {
-					return StartPoCNodeCommandV2{
-						BlockHeight: pocGenParams.startPoCBlockHeight,
-						BlockHash:   pocGenParams.startPoCBlockHash,
-						PubKey:      b.participantInfo.GetPubKey(),
-						CallbackUrl: GetPoCCallbackBaseURLV2(b.callbackUrl),
-						TotalNodes:  totalNodes,
-						Model:       pocGenParams.modelId,
-						SeqLen:      pocGenParams.seqLen,
-					}
-				}
-				return StartPoCNodeCommandV1{
+				return StartPoCNodeCommandV2{
 					BlockHeight: pocGenParams.startPoCBlockHeight,
 					BlockHash:   pocGenParams.startPoCBlockHash,
 					PubKey:      b.participantInfo.GetPubKey(),
-					CallbackUrl: GetPoCCallbackBaseURLV1(b.callbackUrl),
+					CallbackUrl: GetPoCCallbackBaseURLV2(b.callbackUrl),
 					TotalNodes:  totalNodes,
-					ModelParams: nil, // V1 uses chain-stored model params
+					Model:       pocGenParams.modelId,
+					SeqLen:      pocGenParams.seqLen,
 				}
 			}
 			logging.Error("Cannot create StartPoCNodeCommand: missing PoC parameters", types.Nodes, "error", pocGenErr)
 			return nil
 		case PocStatusValidating:
-			if pocGenParams != nil && pocGenParams.startPoCBlockHeight > 0 {
-				// Dispatch V1 or V2 based on governance parameter and migration mode
-				if b.shouldUseV2ForPoC(confirmationEvent) {
-					return TransitionPoCToValidatingCommandV2{}
-				}
-				return InitValidateNodeCommandV1{
-					BlockHeight: pocGenParams.startPoCBlockHeight,
-					BlockHash:   pocGenParams.startPoCBlockHash,
-					PubKey:      b.participantInfo.GetPubKey(),
-					CallbackUrl: GetPoCCallbackBaseURLV1(b.callbackUrl),
-					TotalNodes:  totalNodes,
-					ModelParams: nil, // V1 uses chain-stored model params
-				}
-			}
-			logging.Error("Cannot create InitValidateNodeCommand: missing PoC parameters", types.Nodes, "error", pocGenErr)
-			return nil
+			return TransitionPoCToValidatingCommandV2{}
 		default:
 			return nil // No action for other phases if status is POC
 		}
@@ -1522,6 +1480,9 @@ func (b *Broker) UpdateNodeWithEpochData(epochState *chainphase.EpochState) erro
 
 	parentEpochData := parentGroupResp.GetEpochGroupData()
 
+	// Calculate current participant weight by scanning validation weights across subgroups
+	currentWeight := int64(0)
+
 	b.clearNodeEpochData()
 
 	// 2. Track which nodes are found in epoch data
@@ -1549,6 +1510,12 @@ func (b *Broker) UpdateNodeWithEpochData(epochState *chainphase.EpochState) erro
 		for _, weightInfo := range subgroup.ValidationWeights {
 			// Check if the participant is the one this broker is managing
 			if weightInfo.MemberAddress == b.participantInfo.GetAddress() {
+				// Track participant weight (use ConfirmationWeight if present, else Weight)
+				w := weightInfo.ConfirmationWeight
+				if w == 0 {
+					w = weightInfo.Weight
+				}
+				currentWeight += w
 				// 5. Iterate through the ML nodes for this participant in the epoch data
 				b.UpdateNodeEpochData(weightInfo.MlNodes, modelId, *subgroup.ModelSnapshot)
 				// Mark these nodes as found in epoch
@@ -1558,6 +1525,19 @@ func (b *Broker) UpdateNodeWithEpochData(epochState *chainphase.EpochState) erro
 			}
 		}
 	}
+
+	// If participant weight changed, log and update cached weight
+	if currentWeight != b.lastParticipantWeight {
+		logging.Info("Participant weight changed", types.Participants, "old", b.lastParticipantWeight, "new", currentWeight, "epoch", epochState.LatestEpoch.EpochIndex)
+		b.lastParticipantWeight = currentWeight
+	}
+
+	// Store participant weight on each node state for visibility in admin APIs
+	b.mu.Lock()
+	for _, node := range b.nodes {
+		node.State.ParticipantWeight = currentWeight
+	}
+	b.mu.Unlock()
 
 	// 6. Populate governance models for nodes not in epoch data (disabled nodes)
 	b.mu.RLock()
@@ -1791,4 +1771,34 @@ func (b *Broker) MergeModelArgs(epochArgs []string, localArgs []string) []string
 	}
 
 	return mergedArgs
+}
+
+func (b *Broker) IsParticipantActiveOnChain() (bool, error) {
+	resp, err := b.chainBridge.GetCurrentEpochGroupData()
+	if err != nil {
+		return false, err
+	}
+	if resp == nil {
+		return false, nil
+	}
+	epochIndex := resp.EpochGroupData.EpochIndex
+	subModels := resp.EpochGroupData.SubGroupModels
+	addr := b.participantInfo.GetAddress()
+	for _, mid := range subModels {
+		subgroupResp, err := b.chainBridge.GetEpochGroupDataByModelId(epochIndex, mid)
+		if err != nil {
+			continue
+		}
+		if subgroupResp == nil {
+			continue
+		}
+		for _, w := range subgroupResp.EpochGroupData.ValidationWeights {
+			if w.MemberAddress == addr {
+				if len(w.MlNodes) > 0 {
+					return true, nil
+				}
+			}
+		}
+	}
+	return false, nil
 }

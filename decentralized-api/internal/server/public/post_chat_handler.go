@@ -124,10 +124,10 @@ func emptyButParseableResponsePayload(inferenceId, model string, promptTokens ui
 // checkAndRecordAuthKey checks if an AuthKey has been used before and records it if not
 // Returns true if the key has been used before in the specified context, false otherwise
 func checkAndRecordAuthKey(authKey string, currentBlockHeight int64, context AuthKeyContext) bool {
-	authKeysMutex.RLock()
-	existingContext, exists := usedAuthKeys[authKey]
-	authKeysMutex.RUnlock()
+	authKeysMutex.Lock()
+	defer authKeysMutex.Unlock()
 
+	existingContext, exists := usedAuthKeys[authKey]
 	if exists {
 		// If the key exists, check if it's been used in the current context
 		if existingContext&context != 0 {
@@ -135,20 +135,12 @@ func checkAndRecordAuthKey(authKey string, currentBlockHeight int64, context Aut
 		}
 
 		// Key exists but hasn't been used in this context, update the context
-		authKeysMutex.Lock()
-		defer authKeysMutex.Unlock()
-
-		// Update the context to include the new context
 		usedAuthKeys[authKey] = existingContext | context
 		return false // Key wasn't used before in this context
 	}
 
 	// Key doesn't exist, add it with the current context
-	authKeysMutex.Lock()
-	defer authKeysMutex.Unlock()
-
 	usedAuthKeys[authKey] = context
-
 	authKeysByBlock[currentBlockHeight] = append(authKeysByBlock[currentBlockHeight], authKey)
 
 	if oldestBlockHeight == 0 {
@@ -296,7 +288,7 @@ func (s *Server) handleTransferRequest(ctx echo.Context, request *ChatRequest) e
 	logging.Debug("GET inference requester for transfer", types.Inferences, "address", request.RequesterAddress)
 
 	queryClient := s.recorder.NewInferenceQueryClient()
-	requester, err := queryClient.InferenceParticipant(ctx.Request().Context(), &types.QueryInferenceParticipantRequest{Address: request.RequesterAddress})
+	requester, err := queryClient.AccountByAddress(ctx.Request().Context(), &types.QueryAccountByAddressRequest{Address: request.RequesterAddress})
 	if err != nil {
 		logging.Error("Failed to get inference requester", types.Inferences, "address", request.RequesterAddress, "error", err)
 		return err
@@ -412,7 +404,7 @@ func (s *Server) handleTransferRequest(ctx echo.Context, request *ChatRequest) e
 	logging.Info("Proxying response from executor", types.Inferences,
 		"inferenceId", inferenceUUID,
 		"executor", executor.Address)
-	proxyResponse(resp, ctx.Response().Writer, false, nil, inferenceUUID)
+	ProxyResponse(resp, ctx.Response().Writer, false, nil, inferenceUUID)
 	return nil
 }
 
@@ -540,7 +532,11 @@ func (s *Server) handleExecutorRequest(ctx echo.Context, request *ChatRequest, w
 		logging.Error("Failed to compute prompt hash", types.Inferences, "error", err)
 		return echo.NewHTTPError(http.StatusBadRequest, "Failed to compute prompt hash")
 	}
-	if request.PromptHash != "" && computedPromptHash != request.PromptHash {
+	if request.PromptHash == "" {
+		logging.Error("Empty prompt hash", types.Inferences)
+		return echo.NewHTTPError(http.StatusBadRequest, "Prompt hash is missing")
+	}
+	if computedPromptHash != request.PromptHash {
 		logging.Error("Prompt hash mismatch", types.Inferences,
 			"expected", request.PromptHash, "computed", computedPromptHash)
 		return echo.NewHTTPError(http.StatusBadRequest, "Prompt hash mismatch")
@@ -601,7 +597,7 @@ func (s *Server) handleExecutorRequest(ctx echo.Context, request *ChatRequest, w
 
 	responseProcessor := completionapi.NewExecutorResponseProcessor(request.InferenceId)
 	logging.Debug("Proxying response from inference node", types.Inferences, "inferenceId", request.InferenceId)
-	proxyResponse(resp, w, true, responseProcessor, inferenceId)
+	ProxyResponse(resp, w, true, responseProcessor, inferenceId)
 
 	logging.Debug("Processing response from inference node", types.Inferences, "inferenceId", request.InferenceId)
 	completionResponse, err := responseProcessor.GetResponse()
@@ -626,7 +622,7 @@ func (s *Server) getAllowedPubKeys(ctx echo.Context, granterAddress string) ([]s
 
 func (s *Server) validateFullRequest(ctx echo.Context, request *ChatRequest) error {
 	queryClient := s.recorder.NewInferenceQueryClient()
-	dev, err := queryClient.InferenceParticipant(ctx.Request().Context(), &types.QueryInferenceParticipantRequest{Address: request.RequesterAddress})
+	dev, err := queryClient.AccountByAddress(ctx.Request().Context(), &types.QueryAccountByAddressRequest{Address: request.RequesterAddress})
 	if err != nil {
 		logging.Error("Failed to get inference requester", types.Inferences, "address", request.RequesterAddress, "error", err)
 		return err
@@ -976,10 +972,10 @@ func readRequestBody(r *http.Request, writer http.ResponseWriter) ([]byte, error
 }
 
 // validateRequester validates requester with dynamic pricing fallback to legacy
-func (s *Server) validateRequester(ctx context.Context, request *ChatRequest, requester *types.QueryInferenceParticipantResponse, promptTokenCount int) error {
+func (s *Server) validateRequester(ctx context.Context, request *ChatRequest, requester *types.QueryAccountByAddressResponse, promptTokenCount int) error {
 	if requester == nil {
-		logging.Error("Inference participant not found", types.Inferences, "address", request.RequesterAddress)
-		return ErrInferenceParticipantNotFound
+		logging.Error("Account not found", types.Inferences, "address", request.RequesterAddress)
+		return ErrAccountNotFound
 	}
 
 	err := validateTransferRequest(request, requester.Pubkey)

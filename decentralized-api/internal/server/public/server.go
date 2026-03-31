@@ -10,6 +10,7 @@ import (
 	"decentralized-api/internal/server/middleware"
 	"decentralized-api/payloadstorage"
 	"decentralized-api/poc/artifacts"
+	"decentralized-api/statsstorage"
 	"decentralized-api/training"
 	"net/http"
 	"time"
@@ -35,6 +36,7 @@ type Server struct {
 	artifactStore       *artifacts.ManagedArtifactStore
 	authzCache          *authzcache.AuthzCache
 	httpClient          *http.Client
+	statsStorage        statsstorage.StatsStorage
 }
 
 // ServerOption configures optional Server dependencies.
@@ -44,6 +46,12 @@ type ServerOption func(*Server)
 func WithArtifactStore(store *artifacts.ManagedArtifactStore) ServerOption {
 	return func(s *Server) {
 		s.artifactStore = store
+	}
+}
+
+func WithStatsStorage(store statsstorage.StatsStorage) ServerOption {
+	return func(s *Server) {
+		s.statsStorage = store
 	}
 }
 
@@ -93,7 +101,7 @@ func NewServer(
 	g.GET("chat/completions", s.getChatById)
 	g.GET("inference/payloads", s.getInferencePayloads)
 
-	g.GET("participants/:address", s.getInferenceParticipantByAddress)
+	g.GET("participants/:address", s.getAccountByAddress)
 	g.GET("participants", s.getAllParticipants)
 	g.POST("participants", s.submitNewParticipantHandler)
 
@@ -109,6 +117,14 @@ func NewServer(
 	g.GET("models", s.getModels)
 	g.GET("governance/pricing", s.getGovernancePricing)
 	g.GET("governance/models", s.getGovernanceModels)
+	//TODO: Remove later - response format used by old dashboard
+	g.GET("governance/models-legacy", s.getGovernanceModelsLegacy)
+	g.GET("stats/models", s.getStatsModels)
+	g.GET("stats/developers/:developer/inferences", s.getStatsDeveloperInferences)
+	g.GET("stats/developers/:developer/summary/epochs", s.getStatsDeveloperSummaryEpochs)
+	g.GET("stats/summary/epochs", s.getStatsSummaryEpochs)
+	g.GET("stats/summary/time", s.getStatsSummaryTime)
+	g.GET("stats/debug/developers", s.getStatsDebugDevelopers)
 	g.GET("poc-batches/:epoch", s.getPoCBatches)
 
 	g.GET("debug/pubkey-to-addr/:pubkey", s.debugPubKeyToAddr)
@@ -146,7 +162,17 @@ func NewServer(
 	// PoC artifact state endpoint (for testermint/validators to get real count and root_hash)
 	g.GET("poc/artifacts/state", s.getPocArtifactsState)
 
+	v2 := e.Group("/v2/")
+	v2.GET("participants/:address", s.getParticipantByAddress)
+	v2.GET("accounts/:address", s.getAccountByAddress)
+
 	return s
+}
+
+// SubnetGroup returns an echo group for mounting subnet routes.
+// Mounted under /v1/subnet so nginx's existing /v1/ location proxies it.
+func (s *Server) SubnetGroup() *echo.Group {
+	return s.e.Group("/v1/subnet")
 }
 
 func (s *Server) Start(addr string) {

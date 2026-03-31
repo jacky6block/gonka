@@ -46,12 +46,12 @@ func (am AppModule) AutoCLIOptions() *autocliv1.ModuleOptions {
 					PositionalArgs: []*autocliv1.PositionalArgDescriptor{},
 				},
 
-				{
-					RpcMethod:      "InferenceParticipant",
-					Use:            "inference-participant [address]",
-					Short:          "Query inference-participant",
-					PositionalArgs: []*autocliv1.PositionalArgDescriptor{{ProtoField: "address"}},
-				},
+			{
+				RpcMethod:      "AccountByAddress",
+				Use:            "account-by-address [address]",
+				Short:          "Query account public key and balance by address",
+				PositionalArgs: []*autocliv1.PositionalArgDescriptor{{ProtoField: "address"}},
+			},
 
 				{
 					RpcMethod: "EpochGroupDataAll",
@@ -74,11 +74,6 @@ func (am AppModule) AutoCLIOptions() *autocliv1.ModuleOptions {
 					Use:            "show-settle-amount [id]",
 					Short:          "Shows a settleAmount",
 					PositionalArgs: []*autocliv1.PositionalArgDescriptor{{ProtoField: "participant"}},
-				},
-				{
-					RpcMethod: "EpochGroupValidationsAll",
-					Use:       "list-epoch-group-validations",
-					Short:     "List all epochGroupValidations",
 				},
 				{
 					RpcMethod:      "EpochGroupValidations",
@@ -345,6 +340,12 @@ func (am AppModule) AutoCLIOptions() *autocliv1.ModuleOptions {
 					Short:          "Query all confirmation PoC events for an epoch",
 					PositionalArgs: []*autocliv1.PositionalArgDescriptor{{ProtoField: "epoch_index"}},
 				},
+				{
+					RpcMethod:      "SubnetEscrow",
+					Use:            "show-subnet-escrow [id]",
+					Short:          "Query a subnet escrow by ID",
+					PositionalArgs: []*autocliv1.PositionalArgDescriptor{{ProtoField: "id"}},
+				},
 				// this line is used by ignite scaffolding # autocli/query
 			},
 		},
@@ -366,6 +367,14 @@ func (am AppModule) AutoCLIOptions() *autocliv1.ModuleOptions {
 				},
 				{
 					RpcMethod: "RegisterLiquidityPool",
+					Skip:      true, // skipped because authority gated
+				},
+				{
+					RpcMethod: "ApproveIbcTokenForTrading",
+					Skip:      true, // skipped because authority gated
+				},
+				{
+					RpcMethod: "RegisterIbcTokenMetadata",
 					Skip:      true, // skipped because authority gated
 				},
 				{
@@ -499,6 +508,16 @@ func (am AppModule) AutoCLIOptions() *autocliv1.ModuleOptions {
 					Use:            "request-bridge-mint [amount] [destination-address] [target-chain-id]",
 					Short:          "Request minting of WGNK tokens on Ethereum by bridging native Gonka",
 					PositionalArgs: []*autocliv1.PositionalArgDescriptor{{ProtoField: "amount"}, {ProtoField: "destination_address"}, {ProtoField: "chain_id"}},
+				},
+				{
+					RpcMethod:      "CreateSubnetEscrow",
+					Use:            "create-subnet-escrow [amount]",
+					Short:          "Create a subnet escrow",
+					PositionalArgs: []*autocliv1.PositionalArgDescriptor{{ProtoField: "amount"}},
+				},
+				{
+					RpcMethod: "SettleSubnetEscrow",
+					Skip:      true,
 				},
 				// this line is used by ignite scaffolding # autocli/tx
 			},
