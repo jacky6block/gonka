@@ -195,6 +195,8 @@ type Node struct {
 	InferencePort    int                  `json:"inference_port"`
 	PoCSegment       string               `json:"poc_segment"`
 	PoCPort          int                  `json:"poc_port"`
+	BaseURL          string               `json:"base_url"`
+	AuthToken        string               `json:"auth_token"`
 	Models           map[string]ModelArgs `json:"models"`
 	Id               string               `json:"id"`
 	MaxConcurrent    int                  `json:"max_concurrent"`
@@ -202,15 +204,47 @@ type Node struct {
 	Hardware         []apiconfig.Hardware `json:"hardware"`
 }
 
+type MlNodePathElements struct {
+	Host    string `json:"host"`
+	Port    int    `json:"port"`
+	BaseURL string `json:"base_url"`
+	Version string `json:"version"`
+	Segment string `json:"segment"`
+}
+
+func GetMlNodeUrl(elements MlNodePathElements) string {
+	// If BaseURL is provided, build on top of it
+	if strings.TrimSpace(elements.BaseURL) != "" {
+		base := strings.TrimRight(elements.BaseURL, "/")
+		if strings.TrimSpace(elements.Version) == "" {
+			return fmt.Sprintf("%s%s", base, elements.Segment)
+		}
+		return fmt.Sprintf("%s/%s%s", base, strings.TrimSpace(elements.Version), elements.Segment)
+	}
+	if strings.TrimSpace(elements.Version) == "" {
+		return fmt.Sprintf("http://%s:%d%s", elements.Host, elements.Port, elements.Segment)
+	}
+	return fmt.Sprintf("http://%s:%d/%s%s", elements.Host, elements.Port, strings.TrimSpace(elements.Version), elements.Segment)
+}
+
 func (n *Node) InferenceUrl() string {
 	return fmt.Sprintf("http://%s:%d%s", n.Host, n.InferencePort, n.InferenceSegment)
 }
 
 func (n *Node) InferenceUrlWithVersion(version string) string {
-	if version == "" {
+	v := strings.TrimSpace(version)
+	// If BaseURL is provided, build on top of it
+	if n.BaseURL != "" {
+		base := strings.TrimRight(n.BaseURL, "/")
+		if v == "" {
+			return fmt.Sprintf("%s%s", base, n.InferenceSegment)
+		}
+		return fmt.Sprintf("%s/%s%s", base, v, n.InferenceSegment)
+	}
+	if v == "" {
 		return n.InferenceUrl()
 	}
-	return fmt.Sprintf("http://%s:%d/%s%s", n.Host, n.InferencePort, version, n.InferenceSegment)
+	return fmt.Sprintf("http://%s:%d/%s%s", n.Host, n.InferencePort, v, n.InferenceSegment)
 }
 
 func (n *Node) PoCUrl() string {
@@ -218,10 +252,32 @@ func (n *Node) PoCUrl() string {
 }
 
 func (n *Node) PoCUrlWithVersion(version string) string {
-	if version == "" {
+	v := strings.TrimSpace(version)
+	// If BaseURL is provided, build on top of it
+	if n.BaseURL != "" {
+		base := strings.TrimRight(n.BaseURL, "/")
+		if v == "" {
+			return fmt.Sprintf("%s%s", base, n.PoCSegment)
+		}
+		return fmt.Sprintf("%s/%s%s", base, v, n.PoCSegment)
+	}
+	if v == "" {
 		return n.PoCUrl()
 	}
-	return fmt.Sprintf("http://%s:%d/%s%s", n.Host, n.PoCPort, version, n.PoCSegment)
+	return fmt.Sprintf("http://%s:%d/%s%s", n.Host, n.PoCPort, v, n.PoCSegment)
+}
+
+// BaseUrlWithVersion constructs a base URL with version
+func BaseUrlWithVersion(baseURL, version string) string {
+	base := strings.TrimRight(baseURL, "/")
+	if strings.TrimSpace(version) != "" {
+		return fmt.Sprintf("%s/%s", base, strings.TrimSpace(version))
+	}
+	return base
+}
+
+func (n *Node) BaseUrlWithVersion(version string) string {
+	return BaseUrlWithVersion(n.BaseURL, version)
 }
 
 type NodeWithState struct {
@@ -500,7 +556,7 @@ func (b *Broker) QueueMessage(command Command) error {
 
 func (b *Broker) NewNodeClient(node *Node) mlnodeclient.MLNodeClient {
 	version := b.configManager.GetCurrentNodeVersion()
-	return b.mlNodeClientFactory.CreateClient(node.PoCUrlWithVersion(version), node.InferenceUrlWithVersion(version))
+	return b.mlNodeClientFactory.CreateClient(node.PoCUrlWithVersion(version), node.InferenceUrlWithVersion(version), node.AuthToken, node.BaseUrlWithVersion(version))
 }
 
 func (b *Broker) lockAvailableNode(command LockAvailableNode) {
@@ -664,7 +720,7 @@ func (b *Broker) GetNodes() ([]NodeResponse, error) {
 	nodes := <-command.Response
 
 	if nodes == nil {
-		return nil, errors.New("Error getting nodes")
+		return nil, errors.New("error getting nodes")
 	}
 	logging.Debug("Got nodes", types.Nodes, "size", len(nodes))
 	return nodes, nil

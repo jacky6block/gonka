@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -469,16 +470,8 @@ func (s *Server) getPromptTokenCount(text string, model string) (int, error) {
 			Model:  model,
 			Prompt: text,
 		}
-		jsonData, err := json.Marshal(reqBody)
-		if err != nil {
-			return nil, broker.NewApplicationActionError(err)
-		}
 
-		resp, postErr := s.httpClient.Post(
-			tokenizeUrl,
-			"application/json",
-			bytes.NewReader(jsonData),
-		)
+		resp, postErr := utils.SendPostJsonRequestWithAuth(context.Background(), s.httpClient, tokenizeUrl, reqBody, node.AuthToken)
 		if postErr != nil {
 			return nil, broker.NewTransportActionError(postErr)
 		}
@@ -556,11 +549,15 @@ func (s *Server) handleExecutorRequest(ctx echo.Context, request *ChatRequest, w
 		if err != nil {
 			return nil, broker.NewApplicationActionError(err)
 		}
-		resp, postErr := s.httpClient.Post(
-			completionsUrl,
-			request.Request.Header.Get("Content-Type"),
-			bytes.NewReader(modifiedRequestBody.NewBody),
-		)
+		req, err := http.NewRequest(http.MethodPost, completionsUrl, bytes.NewBuffer(modifiedRequestBody.NewBody))
+		if err != nil {
+			return nil, broker.NewApplicationActionError(fmt.Errorf("failed to create request: %w", err))
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if strings.TrimSpace(node.AuthToken) != "" {
+			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", strings.TrimSpace(node.AuthToken)))
+		}
+		resp, postErr := s.httpClient.Do(req)
 		if postErr != nil {
 			return nil, broker.NewTransportActionError(postErr)
 		}
